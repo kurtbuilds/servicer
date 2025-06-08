@@ -15,7 +15,7 @@ use tokio::process::Command;
 pub async fn find_binary_path(
     binary_name: &str,
     user: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     // Runs sudo -u hp bash -i -c "which deno"
     let output = Command::new("sudo")
         .arg("-u")
@@ -29,9 +29,8 @@ pub async fn find_binary_path(
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
-    if !output.status.success() {
-        panic!("Failed to find {binary_name} in PATH")
-    }
-
-    Ok(stdout)
+    Ok(output
+        .status
+        .success()
+        .then(|| stdout.trim_end_matches("\n").to_string()))
 }

@@ -14,10 +14,13 @@ use handlers::handle_print_paths::handle_print_paths;
 use handlers::handle_print_service_file::handle_print_service_file;
 use handlers::handle_reload_service::handle_reload_service;
 use handlers::handle_rename_service::handle_rename_service;
+use handlers::handle_restart_service::handle_restart_service;
 use handlers::handle_show_logs::handle_show_logs;
 use handlers::handle_show_status::handle_show_status;
 use handlers::handle_start_service::handle_start_service;
 use handlers::handle_stop_service::handle_stop_service;
+
+use crate::handlers::handle_create_service::CreateArgs;
 
 /// servicer process manager
 #[derive(Parser, Debug)]
@@ -31,42 +34,42 @@ struct Args {
 pub enum Commands {
     /// Create a systemd service for a file at the given path
     #[command(arg_required_else_help = true)]
-    Create {
-        /// The file path
-        path: PathBuf,
+    Create(CreateArgs),
+    // /// Optional custom name for the service
+    // #[arg(short, long)]
+    // name: Option<String>,
 
-        /// Optional custom name for the service
-        #[arg(short, long)]
-        name: Option<String>,
+    // /// Optional user for the service
+    // #[arg(short, long)]
+    // user: Option<String>,
 
-        /// Start the service
-        #[arg(short, long)]
-        start: bool,
+    // /// Start the service
+    // #[arg(short, long)]
+    // start: bool,
 
-        /// Enable the service to start every time on boot. This doesn't immediately start the service, to do that run
-        /// together with `start
-        #[arg(short, long)]
-        enable: bool,
+    // /// Enable the service to start every time on boot. This doesn't immediately start the service, to do that run
+    // /// together with `start`
+    // #[arg(short, long)]
+    // enable: bool,
 
-        /// Auto-restart on failure. Default false. You should edit the .service file for more advanced features.
-        /// The service must be enabled for auto-restart to work.
-        #[arg(short = 'r', long)]
-        auto_restart: bool,
+    // /// Auto-restart on failure. Default false. You should edit the .service file for more advanced features.
+    // /// The service must be enabled for auto-restart to work.
+    // #[arg(short = 'r', long)]
+    // auto_restart: bool,
 
-        /// Optional custom interpreter. Input can be the executable's name, eg `python3` or the full path
-        /// `usr/bin/python3`. If no input is provided servicer will use the file extension to detect the interpreter.
-        #[arg(short, long)]
-        interpreter: Option<String>,
+    // /// Optional custom interpreter. Input can be the executable's name, eg `python3` or the full path
+    // /// `usr/bin/python3`. If no input is provided servicer will use the file extension to detect the interpreter.
+    // #[arg(short, long)]
+    // interpreter: Option<String>,
 
-        /// Optional environment variables. To run `FOO=BAR node index.js` call `ser create index.js --env_vars "FOO=BAR"`
-        #[arg(short = 'v', long)]
-        env_vars: Option<String>,
+    // /// Optional environment variables. To run `FOO=BAR node index.js` call `ser create index.js --env_vars "FOO=BAR"`
+    // #[arg(short = 'v', long)]
+    // env_vars: Vec<String>,
 
-        /// Optional args passed to the file. Eg. to run `node index.js --foo bar` call `ser create index.js -- --foo bar`
-        #[arg(last = true)]
-        internal_args: Vec<String>,
-    },
-
+    // /// Optional args passed to the file. Eg. to run `node index.js --foo bar` call `ser create index.js -- --foo bar`
+    // // #[arg(last = true)]
+    // command: Vec<String>,
+    // },
     /// Open a text editor to create or edit the .service file for a service
     #[command(arg_required_else_help = true)]
     Edit {
@@ -87,6 +90,13 @@ pub enum Commands {
     /// Stop a service
     #[command(arg_required_else_help = true)]
     Stop {
+        /// The service name, eg. hello-world
+        name: String,
+    },
+
+    /// Restart a service
+    #[command(arg_required_else_help = true)]
+    Restart {
         /// The service name, eg. hello-world
         name: String,
     },
@@ -168,32 +178,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     match args.command {
-        Commands::Create {
-            path,
-            name,
-            start,
-            enable,
-            auto_restart,
-            interpreter,
-            env_vars,
-            internal_args,
-        } => {
-            handle_create_service(
-                path,
-                name,
-                start,
-                enable,
-                auto_restart,
-                interpreter,
-                env_vars,
-                internal_args,
-            )
-            .await?
-        }
-
+        Commands::Create(create) => handle_create_service(create).await?,
+        // Commands::Create {
+        //     name,
+        //     user,
+        //     start,
+        //     enable,
+        //     auto_restart,
+        //     interpreter,
+        //     env_vars,
+        //     command,
+        // } => {
+        //     handle_create_service(
+        //         path,
+        //         name,
+        //         start,
+        //         enable,
+        //         auto_restart,
+        //         interpreter,
+        //         env_vars,
+        //         internal_args,
+        //     )
+        //     .await?
+        // }
         Commands::Start { name } => handle_start_service(&name, true).await?,
 
         Commands::Stop { name } => handle_stop_service(&name, true).await?,
+
+        Commands::Restart { name } => handle_restart_service(&name, true).await?,
 
         Commands::Enable { name } => handle_enable_service(&name, true).await?,
 

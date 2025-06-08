@@ -1,4 +1,6 @@
+use clap::Parser;
 use indoc::formatdoc;
+use libc::LOG_AUTH;
 use std::{env, path::PathBuf};
 use tokio::fs;
 
@@ -23,85 +25,131 @@ use crate::{
 /// * `env_vars`
 /// * `internal_args`
 ///
-pub async fn handle_create_service(
-    path: PathBuf,
-    custom_name: Option<String>,
+#[derive(Parser, Debug)]
+pub struct CreateArgs {
+    /// Optional custom name for the service
+    #[arg(short, long)]
+    name: Option<String>,
+
+    /// Working directory for the service
+    #[arg(short, long)]
+    directory: Option<String>,
+
+    /// Print the service file that would be created, but don't create it
+    /// can also think of it as "dry"
+    #[arg(short = 'D', long)]
+    debug: bool,
+
+    /// Optional user for the service
+    #[arg(short, long)]
+    user: Option<String>,
+
+    /// Start the service
+    #[arg(short, long)]
     start: bool,
+
+    /// Enable the service to start every time on boot. This doesn't immediately start the service, to do that run
+    /// together with `start`
+    #[arg(short, long)]
     enable: bool,
+
+    /// Auto-restart on failure. Default false. You should edit the .service file for more advanced features.
+    /// The service must be enabled for auto-restart to work.
+    #[arg(short = 'r', long)]
     auto_restart: bool,
-    custom_interpreter: Option<String>,
-    env_vars: Option<String>,
-    internal_args: Vec<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if !path.is_file() {
-        return Err(format!("{} is not a file", path.to_str().unwrap()).into());
-    }
 
-    // The file name including extension, eg. index.js
-    let file_name = path
-        .file_name()
-        .expect("Failed to get file name")
-        .to_str()
-        .expect("Failed to stringify file name")
-        .to_string();
+    /// Optional custom interpreter. Input can be the executable's name, eg `python3` or the full path
+    /// `usr/bin/python3`. If no input is provided servicer will use the file extension to detect the interpreter.
+    #[arg(short, long)]
+    interpreter: Option<String>,
 
-    let service_name = custom_name.unwrap_or_else(|| file_name.to_string());
+    /// Optional environment variables. To run `FOO=BAR node index.js` call `ser create index.js --env_vars "FOO=BAR"`
+    #[arg(short = 'v', long)]
+    env_vars: Vec<String>,
+
+    /// Optional args passed to the file. Eg. to run `node index.js --foo bar` call `ser create index.js -- --foo bar`
+    // #[arg(last = true)]
+    command: Vec<String>,
+}
+
+pub async fn handle_create_service(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let path = args.command.first().expect("No command provided");
+    let path = PathBuf::from(path);
+
+    let service_name = args
+        .name
+        .unwrap_or_else(|| path.file_name().unwrap().to_str().unwrap().to_string());
+
     let full_service_name = get_full_service_name(&service_name);
 
     // Create file if it doesn't exist
     let service_file_path = get_service_file_path(&full_service_name);
-    let service_file_path_str = service_file_path.to_str().unwrap().to_string();
+    let service_file_path_str = service_file_path.to_str().unwrap();
 
     if service_file_path.exists() {
-        panic!(
-            "Service {} already exists at {}. Provide a custom name with --name or delete the existing service with `ser delete {}",
-            service_name,
-            service_file_path_str,
-            service_name
-        );
-    } else {
-        let interpreter = match custom_interpreter {
-            Some(_) => custom_interpreter,
-            None => get_interpreter(path.extension()),
-        };
-
-        // Handle case `ser create index.js` where relative path lacks ./
-        let mut parent_path = path.parent().unwrap();
-        let current_dir = env::current_dir().unwrap();
-        if parent_path.to_str() == Some("") {
-            parent_path = &current_dir;
-        }
-        let working_directory = fs::canonicalize(parent_path)
-            .await
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-
-        create_service_file(
-            &service_file_path_str,
-            &working_directory,
-            auto_restart,
-            interpreter,
-            env_vars,
-            internal_args,
-            &file_name,
-        )
-        .await
-        .unwrap();
-
-        println!("Service {service_name} created at {service_file_path_str}. To start run `ser start {service_name}`");
-
-        if start {
-            handle_start_service(&service_name, false).await.unwrap();
-        }
-        if enable {
-            handle_enable_service(&service_name, false).await.unwrap();
-        }
-
-        handle_show_status().await?;
+        panic!("Service {service_name} already exists at {service_file_path_str}. Provide a custom name with --name or delete the existing service with `ser delete {service_name}");
     }
 
+    let user = args
+        .user
+        .or(env::var("SUDO_USER").ok())
+        .unwrap_or_else(|| env::var("USER").expect("USER is not set"));
+
+    let mut interpreter = args
+        .interpreter
+        .or_else(|| get_interpreter(path.extension()));
+    if let Some(i) = interpreter {
+        let bin = find_binary_path(&i, &user)
+            .await
+            .unwrap()
+            .expect("No binary for interpreter");
+        interpreter = Some(bin);
+    }
+
+    let directory = if let Some(directory) = args.directory {
+        fs::canonicalize(directory)
+            .await
+            .expect("Unknown directory")
+    } else if interpreter.is_some() {
+        let path = path.parent().unwrap();
+        if path.to_str() == Some("") {
+            env::current_dir().unwrap()
+        } else {
+            fs::canonicalize(path).await.unwrap()
+        }
+    } else {
+        env::current_dir().unwrap()
+    };
+    let directory = directory.to_str().unwrap();
+
+    let mut command = args.command;
+    if let Some(interpreter) = interpreter {
+        command.insert(0, interpreter);
+    } else {
+        if !path.is_file() {
+            let bin = find_binary_path(path.to_str().unwrap(), &user)
+                .await
+                .unwrap();
+            if let Some(bin) = bin {
+                command[0] = bin;
+            }
+        }
+    }
+    let restart = args.auto_restart;
+    let service_body = create_service_file(command, directory, &user, args.env_vars, restart);
+    if args.debug {
+        print!("{}", service_body)
+    } else {
+        fs::write(&service_file_path, service_body).await.unwrap();
+        println!("Service {service_name} created at {service_file_path_str}. To start run `ser start {service_name}`");
+        if args.start {
+            handle_start_service(&service_name, false).await.unwrap();
+        }
+        if args.enable {
+            handle_enable_service(&service_name, false).await.unwrap();
+        }
+        handle_show_status().await?;
+    }
     Ok(())
 }
 
@@ -112,92 +160,35 @@ pub async fn handle_create_service(
 /// * `extension`: The file extension
 ///
 fn get_interpreter(extension: Option<&std::ffi::OsStr>) -> Option<String> {
-    match extension {
-        Some(extension_os_str) => {
-            let extension_str = extension_os_str
-                .to_str()
-                .expect("failed to stringify extension");
-
-            let interpreter = match extension_str {
-              "js" => "node",
-              "py" => "python3",
-              _ => panic!("No interpeter found for extension {}. Please provide a custom interpeter and try again.", extension_str)
-          };
-
-            Some(interpreter.to_string())
-        }
-        None => None,
-    }
+    let extension = extension?;
+    let extension_str = extension.to_str().expect("failed to stringify extension");
+    let i = match extension_str {
+        "js" => "node",
+        "py" => "python3",
+        _ => return None,
+    };
+    Some(i.to_string())
 }
 
 /// Creates a systemd service file at `/etc/systemd/system/{}.ser.service` and returns the unit name
-///
-/// # Arguments
-///
-/// * `service_name`- Name of the service without '.ser.service' in the end
-/// * `service_file_path` - Path where the service file will be written
-/// * `working_directory` - Working directory of the file to execute
-/// * `auto_restart` - Auto restart the service on error
-/// * `interpreter` - The executable used to run the app, eg. `node` or `python3`. The executable
-/// must be visible from path for a sudo user. Note that the app itself does not run in sudo.
-/// * `env_vars` - Environment variables
-/// * `internal_args` - Args passed to the file
-/// * `file_name` - Name of the file to run
-///
-async fn create_service_file(
-    service_file_path: &str,
-    working_directory: &str,
+fn create_service_file(
+    command: Vec<String>,
+    directory: &str,
+    user: &str,
+    env_vars: Vec<String>,
     auto_restart: bool,
-    interpreter: Option<String>,
-    env_vars: Option<String>,
-    internal_args: Vec<String>,
-    file_name: &str,
-) -> std::io::Result<()> {
+) -> String {
     // This gets `root` instead of `hp` if sudo is used
-    let user =
-        env::var("SUDO_USER").expect("Must be in sudo mode. ENV variable $SUDO_USER not found");
-    let mut exec_start = match interpreter {
-        Some(interpreter) => {
-            let interpreter_path = find_binary_path(&interpreter, &user)
-                .await
-                .unwrap()
-                .trim_end_matches("\n")
-                .to_string();
 
-            println!("got path {}", interpreter_path);
+    let mut command = command.join(" ");
 
-            format!("{} {}", interpreter_path, file_name)
-        }
-        None => file_name.to_string(),
-    };
-
-    for arg in internal_args {
-        exec_start = format!("{} {}", exec_start, arg);
+    if auto_restart {
+        command.push_str("\nRestart=always");
     }
-
-    let env_vars_formatted = match env_vars {
-        Some(vars) => {
-            // Split the input string by whitespace
-            let pairs: Vec<&str> = vars.split_whitespace().collect();
-
-            // Format each pair as "Environment=key=value"
-            let formatted_pairs: Vec<String> = pairs
-                .iter()
-                .map(|pair| format!("Environment={}", pair))
-                .collect();
-
-            // Join the formatted pairs with newlines
-            let result = formatted_pairs.join("\n");
-
-            result
-        }
-        None => "".to_string(),
-    };
-
-    let restart_policy = if auto_restart { "Restart=always" } else { "" };
-
-    // Replacement for format!(). This proc macro removes spaces produced by indentation.
-    let service_body = formatdoc! {
+    for var in env_vars {
+        command.push_str(&format!("\nEnvironment={}", var));
+    }
+    formatdoc! {
         r#"
       # Generated with Servicer
       [Unit]
@@ -207,16 +198,11 @@ async fn create_service_file(
       Type=simple
       User={user}
 
-      WorkingDirectory={working_directory}
-      ExecStart={exec_start}
-      {restart_policy}
-      {env_vars_formatted}
+      WorkingDirectory={directory}
+      ExecStart={command}
 
       [Install]
       WantedBy=multi-user.target
       "#
-    };
-
-    // Create the service file and write the content
-    fs::write(service_file_path, service_body.as_bytes()).await
+    }
 }
